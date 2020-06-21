@@ -1,0 +1,425 @@
+---
+title: "Detecção de Fraudes no Tráfego de Cliques em Propagandas de Aplicações Mobile"
+author: "Victor Ferreira de Paula"
+date: "06/06/2020 a 19/06/2020"
+output: pdf_document
+---
+
+# Considerações gerais
+
+Este relatório documenta o processo de criação de um algoritmo para *Detecção de Fraudes no Tráfego de Cliques em Propagandas de Aplicações Mobile*. Este projeto é parte do Curso *Big Data Analytics com R e Microsoft Azure Machine Learning*, da *Data Science Academy*.
+
+O objetivo deste projeto é prever se um usuário vai realizar o download de um app após clicar na publicidade.
+
+Conforme recomendado, foram utilizados os datasets presentes no [kaggle](https://www.kaggle.com/c/talkingdata-adtracking-fraud-detection/data).
+
+# Configurando o diretório de trabalho
+
+O diretório de trabalho foi configurado conforme abaixo. Porém, para execução em outro local, deve-se realizar a alteração.
+
+```{r diretorio, results='hide'}
+setwd("D:/FCD/bigDataRAzure/Cap20-Feedback/Projeto-01")
+getwd()
+```
+
+# Dicionário do dataset
+
+Cada linha do dataset contém dados do histórico de cliques, seguido pelas características:
+
+* *ip:* endereço IP do clique;
+* *app:* ID do aplicativo para marketing;
+* *device:* ID do tipo de dispositivo do celular do usuário (por exemplo, iphone 6 plus, iphone 7, huawei mate 7 etc);
+* *os:* ID da versão do telefone móvel do usuário;
+* *channel:* ID do canal do editor de anúncios para celular
+* *click_time:* registro de data e hora do clique (UTC);
+* *attributed_time:* se o usuário baixar o aplicativo para depois de clicar em um anúncio, este é o horário do download do aplicativo;
+* *is_attributed:* a variável a ser prevista, indicando que o aplicativo foi baixado;
+
+# Etapa 1: Carregando os dados
+
+Pacotes necessários:
+```{r pacotes}
+library(tidyverse)
+library(lubridate)
+library(data.table)
+```
+
+```{r dados}
+dados <- fread("dados.csv", header = T, stringsAsFactors = F)
+
+glimpse(dados)
+```
+
+# Etapa 2: Pré-processamento
+
+Transformando as variáveis *click_time* e *attributed_time* em data usando o pacote *lubridate*:
+```{r transforma_time}
+dados$click_time <- ymd_hms(dados$click_time)
+dados$attributed_time <- ymd_hms(dados$attributed_time)
+```
+
+Para classificar em qual período do dia um clique ou download é realizado, cria-se a função conforme abaixo. Para isso, temos os seguintes períodos do dia:
+
+* 1 = Madrugada: 00:00:00 a 05:59:59  horas
+* 2 = Manhã: 06:00:00 a 11:59:59 horas
+* 3 = Tarde: 12:00:00 a 17:59:59 horas
+* 4 = Noite: 18:00:00: a 23:59:59 horas
+* 0 = Não foi realizado download
+
+```{r periodo_dia_funcao}
+# Retorna o perído do dia de alguma horário
+day_period <- function(x) {
+    
+    if ( !is.na(x) ){
+        hora = hour(x)
+        
+        if ( hora <= 5) { periodo = 1 }
+        if ( 6 <= hora & hora <= 11 ) { periodo = 2 }
+        if ( 12 <= hora & hora <= 17 ) { periodo = 3 }
+        if ( 18 <= hora & hora <= 23 ) { periodo = 4 }
+    } else {
+        periodo = 0
+    }
+    
+    return(periodo)
+}
+```
+
+Testando a função:
+```{r teste_funcao}
+datas <- c("2017-11-18 07:01:20",
+           "2005-12-23 15:05:34",
+           "2020-01-07 05:20:25",
+           "2015-11-11 20:43:59",
+           NA)
+
+sapply(datas, day_period)
+```
+
+Criando uma coluna com o período do dia para as variáveis *click_time* e *attributed_time*:
+```{r periodo_dia}
+dados$period_click_time <- 
+    as.factor(sapply(dados$click_time, day_period))
+
+dados$period_attributed_time <-
+    as.factor(sapply(dados$attributed_time,day_period))
+```
+
+Classificando a variável alvo como fator:
+```{r classifica_fator_is_attributed}
+dados$is_attributed <- factor(dados$is_attributed)
+```
+
+Sumário do pré-processamento:
+```{r sumario}
+glimpse(dados)
+```
+
+# Etapa 3: Análise Exploratória
+
+Verificando a proporção, observamos que 99,77% dos cliques não originaram em download do app. Isso ilustra um desbalanceamento muito elevado dos dados.
+```{r proporcao}
+prop.table(table(dados$is_attributed))
+```
+
+Tendência Central - Cliques por IP:
+```{r cliques_id}
+dados %>% 
+    count(ip) %>% 
+    select(n) -> clicks
+    
+summary(clicks$n)
+
+# Alguns percentis:
+quantile(clicks$n, c(0.8, 0.9, 0.95, 0.99))
+```
+
+Histograma - Cliques por IP:
+```{r plot_clique_ip}
+# "Histograma" dos cliques por IP:
+dados %>% 
+    count(ip) %>%
+    ggplot(mapping = aes(x = as.numeric(ip), y = n) ) +
+        geom_line() +
+        ggtitle("Total de Cliques por IP") +
+        ylab("Número de cliques de cada IP") +
+        xlab("Endereços IP")
+```
+Fração de cliques convertidos em download:
+```{r clicks_convertidos}
+dados %>% 
+    select(ip, is_attributed) %>%
+    filter(is_attributed == 1) %>%
+    count(ip) %>%
+    summarise(total = sum(n)) -> dwd_clicks
+
+as.numeric(dwd_clicks) / sum(clicks$n) 
+
+```
+
+
+
+Podemos considerar valores *outliers* como aqueles que estão $3\sigma$ (sendo $\sigma$ o desvio-padrão) distantes do valor médio. Nesse caso, vamos filtrar os números de ip com mais de $\mu+3\sigma \approx 27$ cliques.
+```{r outliers_clicks}
+mu <- mean(clicks$n)
+sigma <- sd(clicks$n)
+
+mu + 3*sigma
+
+# Contagem dos outliers:
+clicks %>%
+    filter( n > round(mu + 3*sigma)) %>%
+    summarise(total = sum(n)) -> clicks_out
+
+# Proporcão de cliques outliers:
+as.numeric(clicks_out) / sum(clicks$n)
+
+# Histograma dos cliques outliers por IP:
+dados %>% 
+    count(ip) %>%
+    filter(n > round(mu + 3*sigma)) %>%
+    ggplot(mapping = aes(x = as.numeric(ip), y = n)) +
+        geom_line() +
+        ggtitle("Cliques outliers por IP") +
+        ylab("Número de cliques de cada IP") +
+        xlab("Endereços IP")
+```
+
+Vamos verificar quanto dos cliques outliers realizaram o download do app.
+```{r outliers_download}
+dados %>%
+    select(ip, is_attributed) %>%
+    filter(is_attributed == 1) %>%
+    count(ip) %>%
+    summarise(total = sum(n)) -> clicks_out_download
+```
+
+Fração dos cliques outliers que fizeram download:
+```{r fracao_outliers_download}
+as.numeric(clicks_out_download) / clicks_out
+```
+
+Fração dos cliques outliers com mais de 200 cliques:
+```{r fracao_outliers_200}
+dados %>%
+    count(ip) %>%
+    filter(n >= 200) %>%
+    summarise(total = sum(n)) -> clicks_out_200
+
+as.numeric(clicks_out_200) / clicks_out
+
+as.numeric(clicks_out_200) / sum(clicks$n)
+```
+
+
+Cliques por período do dia:
+```{r periodo_cliques}
+ggplot(data = dados) +
+    geom_bar(aes(x = period_click_time)) +
+    ggtitle("Cliques nos períodos do dia")
+
+ggplot(data = subset(dados, period_attributed_time != 0)) +
+    geom_bar(aes(x = period_attributed_time)) +
+    ggtitle("Cliques convertidos em download")
+```
+Cliques convertidos de manhã:
+```{r cliques_dwd_manhã}
+dados %>%
+    select(ip, period_attributed_time) %>%
+    filter(period_attributed_time == 2) %>%
+    count(ip) %>%
+    summarise(total = sum(n)) -> clicks_dwd_morning
+
+as.numeric(clicks_dwd_morning) / as.numeric(dwd_clicks)
+```
+
+
+Para os cliques convertidos, diferença entre o tempo de download e o tempo do clique:
+```{r diff_tempos}
+diff_tempos <- data.frame(ip = dados$ip, 
+               diff=dados$attributed_time - dados$click_time)
+
+# Eliminando os valores NA:
+diff_tempos <- subset( diff_tempos, !is.na(diff_tempos$diff) )
+
+# Colocando em minutos, para facilitar a compreensão:
+diff_tempos$diff <- diff_tempos$diff / 60
+
+# Medidas de Tendência Central (em minutos):
+summary(as.numeric(diff_tempos$diff))
+
+# Alguns percentis (em minutos):
+quantile(diff_tempos$diff, c(0.8, 0.9, 0.95, 0.99))
+
+# "Histograma" usando geom_line():
+ggplot(data =  diff_tempos, aes(y = diff / 60, x = as.numeric(ip))) +
+    geom_line() +
+    ggtitle("Diferença nos tempos clique e download") +
+    xlab("Endereço IP") +
+    ylab("Tempo (horas)")
+```
+
+Para o modelo, não usaremos as variáveis de data *click_time* e *attributed_time*, mas sim as variáveis *period_click_time* e *period_attributed_time*.
+```{r elimina_time}
+dados$click_time <- NULL
+dados$attributed_time <- NULL
+```
+
+Verificando a associação entre as variáveis categóricas:
+```{r associacao}
+chisq.test(x = dados$is_attributed, y = dados$ip)
+chisq.test(x = dados$is_attributed, y = dados$app)
+chisq.test(x = dados$is_attributed, y = dados$device)
+chisq.test(x = dados$is_attributed, y = dados$os)
+chisq.test(x = dados$is_attributed, y = dados$channel)
+chisq.test(x = dados$is_attributed, y = dados$period_click_time)
+chisq.test(x = dados$is_attributed, y = dados$period_attributed_time)
+```
+
+Verificando a força da associação das variáveis com o teste de tau de Goodman e Kruskal:
+```{r força_associacao}
+library(GoodmanKruskal)
+
+GK_matrix <- GKtauDataframe(dados)
+plot(GK_matrix, corrColors = "blue")
+```
+
+Algumas conclusões da Análise Exploratória dos dados:
+
+* Dados altamente desbalancedos, podendo acarretar em *overfitting*;
+
+* Cada endereço de IP gera entre 2 e 3 cliques;
+
+* 80% dos endereços de IP geram 3 cliques;
+
+* 0,2% dos cliques são efetivamente convertidos em download;
+
+* Cerca de 12% dos endereços de IP dão mais de 27 cliques, sendo suspeitos de fraude;
+
+* Dos IPs com mais de 27 cliques, 2% realizam o download;
+
+* Dos IPs com mais de 27 cliques, 25% dão mais que 200 cliques de um total de 100,000 cliques;
+
+* Os IPs com mais que 200 cliques representam 3% dos total de cliques;
+
+* Cerca de 10% dos cliques é realizado no período da madrugada;
+
+* Dos cliques convertidos em download, 40% no período da manhã;
+
+* A média entre clique e download do app é de 75 minutos, aproximadamente;
+
+* A conversão de download está ligada ao enderço de IP, mais do que as outras características;
+
+# Etapa 4: Criação do modelo
+
+Selecionando dados de treino e teste:
+```{r dados_treino_teste}
+library(caret)
+
+trainIndex <- createDataPartition(dados$is_attributed, 
+                                  p = 0.7, 
+                                  list = FALSE)
+
+treino <- dados[ trainIndex, ]
+teste  <- dados[-trainIndex, ]
+```
+
+Observamos que os dados de treino estão desbalanceados:
+```{r treino_desbalanceado}
+prop.table(table(treino$is_attributed))
+```
+
+Balancemento dos dados de treino e teste usando ROSE:
+```{r treino_smote}
+library(ROSE)
+treino_rose <- ROSE(is_attributed ~ . , data = treino)$data
+```
+
+Agora os dados de treino estão balanceados:
+```{r treino_balanceado}
+prop.table(table(treino_rose$is_attributed))
+```
+
+Modelo: K-Nearest Neighbor Classification do pacote class.
+```{r modelo_v1}
+library(class)
+
+modelo_v1 <- knn(train = treino_rose,
+                 test = teste,
+                 cl = treino_rose[, 6],
+                 k = 6)
+
+```
+
+# Etapa 5: Avaliação do modelo
+
+Modelo 1:
+```{r avaliacao_v1}
+previsao <- modelo_v1
+
+# Percentual de previsões corretas com dataset de teste
+mean(previsao == teste$is_attributed)
+
+# Confusion Matrix
+library(gmodels)
+CrossTable(x = previsao, y = teste$is_attributed, chisq = F)
+
+```
+
+# Etapa 6: Otimização
+
+Cabe observar que todas as variáveis do dataset *dados* são do tipo fator.
+```{r classifica_fator_tudo}
+dados$ip <- factor(dados$ip)
+dados$app <- factor(dados$app)
+dados$device <- factor(dados$device)
+dados$os <- factor(dados$os)
+dados$channel <- factor(dados$channel)
+dados$is_attributed <- factor(dados$is_attributed)
+dados$period_click_time <- factor(dados$period_click_time)
+dados$period_attributed_time <- factor(dados$period_attributed_time)
+
+```
+
+Vamos estudar como o modelo knn se comporta quando todas as variáveis são classificadas corretamente.
+```{r otimizacao}
+# Dados de treino e teste
+trainIndex <- createDataPartition(dados$is_attributed, 
+                                  p = 0.7, 
+                                  list = FALSE)
+
+treino <- dados[ trainIndex, ]
+teste  <- dados[-trainIndex, ]
+
+# Balanceamento com ROSE
+treino_rose <- ROSE(is_attributed ~ . , data = treino)$data
+
+# Criação do modelo
+modelo_v2 <- knn(train = treino_rose,
+                 test = teste,
+                 cl = treino_rose[, 6],
+                 k = 6)
+
+previsao <- modelo_v2
+
+# Percentual de previsões corretas com dataset de teste
+mean(previsao == teste$is_attributed)
+
+# Confusion Matrix
+CrossTable(x = previsao, y = teste$is_attributed, chisq = F)
+
+```
+
+A simples reclassificação das variáveis no dataset de treino acarretou num aumento expressivo na performance do modelo.
+
+# Conclusão
+
+O Modelo Knn criado conseguiu uma acurácia maior que 90% para classificação dos dados apresentados. Porém, um estudo mais detalhado dos dados pode ser feito se precisarmos buscar uma performance melhor, como a divisão entre outros períodos do dia nos cliques, ao invés dos realizados aqui, ou seja, subdividir manhã, tarde, noite e madrugada em mais períodos). 
+
+Outro ponto que pode ser realizado para generalização do modelo é um *feature selection* visando escolher as características mais representativas da conversão de cliques em download.
+
+
+
+
+
+
